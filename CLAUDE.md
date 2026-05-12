@@ -16,18 +16,21 @@ The entire pipeline is jointly tuned using **Optuna Bayesian Optimization**.
 
 ### Setup
 ```bash
-# Activate virtual environment
+# Create and activate virtual environment
+python3 -m venv venv
 source venv/bin/activate
 
-# Install dependencies
-pip install -r Notebook/requirements.txt
+# Install backend dependencies
+pip install -r backend/requirements.txt
+
+# (Optional) Install Streamlit for the legacy dashboard
 pip install streamlit plotly holidays
 ```
 
 ### Training & Optimization
 ```bash
 # Train the hybrid model (Prophet + LightGBM + Isolation Forest)
-# Runs 30 Optuna trials, tunes all three models jointly
+# Runs 30 Optuna trials by default; tunes all three models jointly
 python Scripts/hybrid_model.py
 
 # Set number of tuning trials via environment variable
@@ -43,16 +46,46 @@ python Scripts/build_real_datasets.py
 python Scripts/integrate_bmkg.py
 ```
 
-### Dashboard & Visualization
+### Running the System
+
+#### Backend API (FastAPI)
 ```bash
-# Launch the interactive Streamlit dashboard (requires trained models)
+# From project root, with venv activated
+cd backend
+cp .env.example .env
+cd ..
+uvicorn backend.app.main:app --reload --port 8000
+```
+- API docs available at `http://localhost:8000/docs`
+- Endpoints: `/api/health`, `/api/forecast/*`, `/api/anomalies`, `/api/metrics`, `/api/features`
+- See `backend/README.md` for detailed endpoint reference
+
+#### Streamlit Dashboard (Legacy)
+```bash
+# Interactive visualization (requires trained models)
 # Features: historical validation, anomaly marking, SHAP explanations, what-if forecasting
 streamlit run dashboard.py
 ```
 
-### Jupyter Notebooks
+#### Jupyter Notebooks
 - `Notebook/training.ipynb` — exploration-oriented training pipeline
 - `Notebook/inference.ipynb` — inference and prediction examples
+
+## System Architecture Overview
+
+The FindIT system is composed of two primary layers:
+
+1. **ML Pipeline Layer** (`Scripts/`, `Models/`, `Outputs/`) — offline training and model generation
+2. **API Layer** (`backend/`) — FastAPI service wrapping trained models for live inference and serving frontend requests
+
+The API layer exposes endpoints for:
+- Historical validation (reads from `Outputs/dataset_daily_with_predictions.csv`)
+- Live forecasting (N-day-ahead via loaded models)
+- What-if scenarios (interactive inference with SHAP explanations)
+- Anomaly exploration (Isolation Forest detections)
+- Feature metadata and importance
+
+A separate frontend (Next.js) consumes these endpoints at `http://localhost:8000/api` (configurable via `CORS_ORIGINS` env var).
 
 ## Architecture: The Three-Component Hybrid
 
@@ -133,14 +166,25 @@ dashboard.py
 
 ## Core Files & Responsibilities
 
+### ML Pipeline
 | File | Purpose |
 |------|---------|
 | `Scripts/hybrid_model.py` | **Heartbeat of the project.** Loads data, engineers features, runs Optuna optimization, trains final ensemble, exports models and visualizations. ~1000 lines. |
 | `Scripts/build_real_datasets.py` | **Data aggregation.** Parses raw CSVs (BPS yearly, World Bank macro, BMKG weather, PLN daily), normalizes units, aligns dates, splits into train/val/test. |
 | `Scripts/integrate_bmkg.py` | **Weather integration.** Fetches or processes BMKG (Badan Meteorologi, Klimatologi, dan Geofisika) weather data. |
-| `dashboard.py` | **User interface.** Streamlit app displaying predictions, anomalies, and SHAP local explanations. Caches model loads for performance. |
+| `dashboard.py` | **Legacy UI.** Streamlit app displaying predictions, anomalies, and SHAP local explanations. Caches model loads for performance. |
 | `Notebook/training.ipynb` | **Exploratory training** with inline visualization and debugging. |
 | `Notebook/inference.ipynb` | **Inference examples** — how to load models and make predictions. |
+
+### Backend API (`backend/app/`)
+| File | Purpose |
+|------|---------|
+| `main.py` | FastAPI app setup, CORS middleware, router registration, lifespan context (model loading at startup). |
+| `config.py` | Path resolution (`Models/`, `Outputs/`), environment variables, API metadata. |
+| `model_store.py` | Singleton model loader — caches Prophet, LightGBM, Isolation Forest, KNN Imputer in memory at startup. |
+| `schemas.py` | Pydantic request/response models for validation and OpenAPI docs. |
+| `routes/*.py` | HTTP handlers: `health.py` (status), `forecast.py` (historical + future + what-if), `anomalies.py`, `metrics.py`, `features.py`. |
+| `services/*.py` | Business logic: forecast inference, SHAP explanations, metric calculation, anomaly extraction. |
 
 ## Explainable AI (XAI)
 
@@ -152,19 +196,30 @@ The project uses **SHAP (SHapley Additive exPlanations)** to explain predictions
 
 ## Key Environment Variables
 
+### Training & Optimization
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `OPTUNA_TRIALS` | `50` | Number of Bayesian optimization trials |
+| `OPTUNA_TRIALS` | `50` | Number of Bayesian optimization trials (ML Pipeline) |
 | `RETUNE_EVERY_DAYS` | `30` | (Reserved) days before automatic retuning |
 | `FORCE_RETUNE` | `True` | Force re-optimization even if params exist |
 
 Set via: `OPTUNA_TRIALS=100 python Scripts/hybrid_model.py`
 
+### Backend API
+Configure in `backend/.env`:
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MODELS_DIR` | `../Models` | Path to trained model artifacts |
+| `OUTPUTS_DIR` | `../Outputs` | Path to predictions and visualizations |
+| `CORS_ORIGINS` | `http://localhost:3000,http://localhost:3001` | Comma-separated list of allowed frontend origins |
+| `PORT` | `8000` | Server port (uvicorn reads from code, not this env var) |
+
 ## Working with Models & Artifacts
 
-### Loading Pre-Trained Models
+### Loading Pre-Trained Models (Python)
 ```python
 import joblib
+import json
 
 prophet_model = joblib.load('Models/prophet_model.joblib')
 lgbm_model = joblib.load('Models/lgbm_model.joblib')
@@ -174,12 +229,44 @@ best_params = json.load(open('Models/best_hybrid_params.json'))
 ```
 
 ### Making Predictions
+
+**Via Backend API** (recommended for frontend integration):
+```bash
+# Future forecast
+curl http://localhost:8000/api/forecast/future?days=7
+
+# What-if scenario
+curl -X POST http://localhost:8000/api/forecast/whatif \
+  -H "Content-Type: application/json" \
+  -d '{"target_date":"2026-06-01", "avg_temp":28.5, "rainfall":5.2, "is_holiday":false}'
+```
+
+**Via Python** (offline/notebook):
 See `Notebook/inference.ipynb` for end-to-end example.
 
-### Retraining
+### Retraining the Models
 1. Update raw data in `Raw Data/` folders
 2. Run `python Scripts/build_real_datasets.py` to regenerate train/val/test CSVs
 3. Run `python Scripts/hybrid_model.py` to retrain (will re-optimize hyperparameters)
+4. Restart the backend API to load the new models (models are loaded at startup via lifespan context)
+
+### Docker Deployment
+```bash
+# Build from project root (context must include Models/ and Outputs/)
+docker build -f backend/Dockerfile -t findit-api .
+
+# Run locally
+docker run -p 8000:8000 \
+  -e CORS_ORIGINS="http://localhost:3000" \
+  -v $(pwd)/Models:/app/Models \
+  -v $(pwd)/Outputs:/app/Outputs \
+  findit-api
+
+# Production (set CORS_ORIGINS to your Next.js domain)
+docker run -p 8000:8000 \
+  -e CORS_ORIGINS="https://your-frontend.vercel.app" \
+  findit-api
+```
 
 ## Documentation References
 
@@ -187,6 +274,31 @@ See `Notebook/inference.ipynb` for end-to-end example.
 - **[Full Technical Whitepaper](./Documentation/AI_Project_Documentation.md)** — algorithmic logic (Bahasa Indonesia)
 - **[Comprehensive Tech Spec](./Documentation/full_technical_documentation.md)** — implementation details
 - **[Data Dictionary](./Documentation/dataset_documentation.md)** — feature definitions and interactions
+
+## Full-Stack Development
+
+### Local Development Workflow
+```bash
+# Terminal 1: ML training (if needed)
+source venv/bin/activate
+python Scripts/hybrid_model.py
+
+# Terminal 2: Backend API
+source venv/bin/activate
+uvicorn backend.app.main:app --reload --port 8000
+
+# Terminal 3: Frontend (separate repo)
+# Ensure NEXT_PUBLIC_API_URL=http://localhost:8000/api
+cd ../findit-frontend  # or wherever your Next.js app lives
+npm run dev
+```
+
+### Frontend Integration Notes
+- The backend exposes all state via REST endpoints under `/api/*`
+- Models load **once** at startup (see `backend/app/model_store.py`); restart backend after retraining
+- Historical data reads from CSV (`dataset_daily_with_predictions.csv`); real-time forecasts use live inference
+- What-if requests include SHAP waterfall breakdowns for explainability
+- Set `CORS_ORIGINS` to match your frontend origin (localhost:3000 for Next.js dev server)
 
 ## Development Notes
 
